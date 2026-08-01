@@ -232,32 +232,32 @@ function showAddAccountModal(app, proxies = []) {
 
   const getSessionContent = () => `
     <div style="text-align:center;margin-bottom:20px">
-      <div style="font-size:13px;color:var(--text-muted)">Загрузи файл .session (SQLite сессия Telethon или StringSession)</div>
+      <div style="font-size:13px;color:var(--text-muted)">Один файл .session (Telethon / StringSession) или .zip архив с несколькими .session — импортируются все сразу</div>
     </div>
     <div class="form-group">
-      <label class="form-label">Файл сессии (.session)</label>
+      <label class="form-label">Файл .session или архив .zip</label>
       <div class="upload-zone" id="session-upload-zone">
         <div class="upload-zone-icon"></div>
-        <div class="upload-zone-text" id="session-file-name">Нажми или перетащи файл .session сюда</div>
+        <div class="upload-zone-text" id="session-file-name">Нажми или перетащи .session / .zip сюда</div>
       </div>
-      <input type="file" id="inp-session-file" accept=".session" style="display:none">
+      <input type="file" id="inp-session-file" accept=".session,.zip" style="display:none">
     </div>
   `;
 
   const getTDataContent = () => `
     <div style="text-align:center;margin-bottom:20px">
-      <div style="font-size:13px;color:var(--text-muted)">Загрузи .zip архив папки tdata из Telegram Desktop</div>
+      <div style="font-size:13px;color:var(--text-muted)">Загрузи .zip архив — панель возьмёт ТОЛЬКО папки tdata (все, что найдёт), остальные файлы игнорируются. Можно грузить сразу несколько аккаунтов.</div>
     </div>
     <div class="form-group">
-      <label class="form-label">Архив tdata (.zip)</label>
+      <label class="form-label">Архив с tdata (.zip)</label>
       <div class="upload-zone" id="tdata-upload-zone">
         <div class="upload-zone-icon"></div>
-        <div class="upload-zone-text" id="tdata-file-name">Нажми или перетащи .zip архив папки tdata</div>
+        <div class="upload-zone-text" id="tdata-file-name">Нажми или перетащи .zip архив сюда</div>
       </div>
       <input type="file" id="inp-tdata-file" accept=".zip" style="display:none">
     </div>
     <div class="form-group">
-      <label class="form-label">Код-пароль (если установлен в Telegram Desktop)</label>
+      <label class="form-label">Код-пароль (если установлен, общий для всех)</label>
       <input class="form-input" id="inp-tdata-password" placeholder="Пароль от Telegram Desktop (если есть)" type="password">
     </div>
   `;
@@ -269,7 +269,9 @@ function showAddAccountModal(app, proxies = []) {
       <button class="btn btn-ghost btn-sm tab-btn ${activeTab === 'tdata' ? 'active' : ''}" data-tab="tdata" ${step > 1 ? 'disabled style="opacity:0.5"' : ''}>Архив TData</button>
     </div>
     <div id="tab-content">
-      ${activeTab === 'phone' ? getPhoneContent() : activeTab === 'session' ? getSessionContent() : getTDataContent()}
+      ${activeTab === 'phone' ? getPhoneContent()
+        : activeTab === 'session' ? getSessionContent()
+        : getTDataContent()}
     </div>
   `;
 
@@ -329,6 +331,7 @@ function showAddAccountModal(app, proxies = []) {
         }
       };
     }
+
   };
 
   const updateModal = () => {
@@ -388,22 +391,22 @@ function showAddAccountModal(app, proxies = []) {
       } else if (activeTab === 'session') {
         const fileInput = overlay.querySelector('#inp-session-file');
         const file = fileInput.files[0];
-        if (!file) throw new Error('Выбери файл .session');
+        if (!file) throw new Error('Выбери файл .session или .zip архив');
 
-        app.toast('Импорт сессии...', 'info');
+        app.toast('Импорт сессий... это может занять время', 'info');
         const res = await accountsApi.importSession(file);
-        app.toast(`Аккаунт успешно импортирован!`, 'success');
+        reportImport(app, res);
         close();
         renderAccounts(app);
       } else if (activeTab === 'tdata') {
         const fileInput = overlay.querySelector('#inp-tdata-file');
         const file = fileInput.files[0];
-        if (!file) throw new Error('Выбери .zip архив tdata папки');
+        if (!file) throw new Error('Выбери .zip архив с папками tdata');
 
         const password = overlay.querySelector('#inp-tdata-password').value || '';
-        app.toast('Импорт TData...', 'info');
+        app.toast('Импорт TData... это может занять время', 'info');
         const res = await accountsApi.importTData(file, password);
-        app.toast(`Аккаунт успешно импортирован!`, 'success');
+        reportImport(app, res);
         close();
         renderAccounts(app);
       }
@@ -418,6 +421,22 @@ function showAddAccountModal(app, proxies = []) {
       btn.textContent = 'Импортировать';
     }
   };
+}
+
+// Показывает результат импорта (одиночного или массового)
+function reportImport(app, res) {
+  if (res && typeof res.imported === 'number') {
+    if (res.imported > 0) {
+      app.toast(`Импортировано аккаунтов: ${res.imported}` +
+        (res.errors?.length ? `, с ошибками: ${res.errors.length}` : ''), 'success');
+    } else {
+      app.toast('Не удалось импортировать ни одного аккаунта' +
+        (res.errors?.length ? `: ${res.errors[0]}` : ''), 'error');
+    }
+    if (res.errors?.length) console.warn('Ошибки импорта:', res.errors);
+  } else {
+    app.toast('Аккаунт успешно импортирован!', 'success');
+  }
 }
 
 // Генерирует цвет на основе строки (черно-белые и серые тона)

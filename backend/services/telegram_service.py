@@ -237,6 +237,9 @@ class TelegramClientManager:
 
     def save_session_string_as_sqlite(self, session_string: str, account_id: int, api_id: int, api_hash: str):
         """Конвертирует текстовую StringSession в бинарный SQLite .session файл или записывает сырой SQLite."""
+        if not session_string:
+            raise ValueError("Пустая строка сессии — нечего сохранять")
+
         session_path = SESSIONS_DIR / f"{account_id}.session"
         if session_path.exists():
             try:
@@ -265,6 +268,10 @@ class TelegramClientManager:
         """Загружает сохранённую сессию из файла (бинарного SQLite или текстового)."""
         session_path = SESSIONS_DIR / f"{account_id}.session"
         if not session_path.exists():
+            self._last_errors[account_id] = (
+                "Файл сессии не найден. Аккаунт добавлен без валидной сессии — "
+                "переимпортируй .session/tdata или войди заново по номеру."
+            )
             return False
 
         proxy_row = await self._get_proxy_for_account(account_id)
@@ -288,6 +295,7 @@ class TelegramClientManager:
             else:
                 session_string = session_path.read_text(encoding="utf-8").strip()
                 if not session_string:
+                    self._last_errors[account_id] = "Файл сессии пуст — сессия не сохранилась при импорте."
                     return False
                 client = TelegramClient(
                     StringSession(session_string), api_id=api_id, api_hash=api_hash,
@@ -568,6 +576,111 @@ class TelegramClientManager:
 
         finally:
             # Очищаем временную папку
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+    async def _tdata_path_to_session(self, tdata_path: str, api_id: int, api_hash: str,
+                                     password: str = None) -> tuple[str, str, str, str, str]:
+        """Загружает одну tdata-папку (по пути) и возвращает данные + session_string."""
+        tdesk = TDesktop(tdata_path)
+        if not tdesk.isLoaded() or tdesk.accountsCount == 0:
+            raise ValueError("tdata не загружается или пуста")
+        my_api = APIData(api_id=api_id, api_hash=api_hash)
+        client = await tdesk.ToTelethon(flag=UseCurrentSession, api=my_api, password=password)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise ValueError("tdata не авторизована")
+        me = await client.get_me()
+        session_string = self._session_to_string(client.session)
+        await client.disconnect()
+        if not me:
+            raise ValueError("Не удалось получить профиль")
+        return (me.phone or "", me.first_name or "", me.last_name or "", me.username or "", session_string)
+
+    def _session_to_string(self, session) -> str:
+        """Гарантированно строит StringSession-строку из любой сессии Telethon."""
+        from telethon.sessions import StringSession
+        s = session.save()
+        if isinstance(s, str) and s:
+            return s  # уже StringSession
+        # SQLite/файловая сессия — переносим auth_key и DC вручную
+        ss = StringSession()
+        if session.dc_id and session.server_address and session.port:
+            ss.set_dc(session.dc_id, session.server_address, session.port)
+        ss.auth_key = session.auth_key
+        return ss.save()
+
+    async def parse_bulk_archive(self, zip_content: bytes, api_id: int, api_hash: str,
+                                 password: str = None, mode: str = "both") -> tuple[list, list]:
+        """
+        Разбирает zip-архив с НЕСКОЛЬКИМИ аккаунтами.
+        mode:
+          'session' — берём только *.session файлы (tdata игнорируем);
+          'tdata'   — берём только папки tdata (файлы игнорируем), все, что нашли;
+          'both'    — и то и другое, но tdata рядом с .session пропускаем как дубль.
+        Возвращает (accounts, errors), где accounts — список
+        (phone, first, last, username, session_string, source).
+        """
+        temp_dir = tempfile.mkdtemp()
+        accounts, errors = [], []
+        try:
+            zip_path = Path(temp_dir) / "bulk.zip"
+            zip_path.write_bytes(zip_content)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(temp_dir)
+            try:
+                zip_path.unlink()
+            except OSError:
+                pass
+
+            # Собираем все .session файлы и все tdata-папки
+            session_files = []
+            tdata_dirs = []
+            for root, dirs, files in os.walk(temp_dir):
+                for f in files:
+                    if f.lower().endswith(".session") and not f.endswith("-journal"):
+                        session_files.append(os.path.join(root, f))
+                if "key_datas" in files or "D877F783D5D3EF8C" in files:
+                    tdata_dirs.append(root)
+                elif os.path.basename(root).lower() == "tdata":
+                    tdata_dirs.append(root)
+            tdata_dirs = sorted(set(tdata_dirs))
+
+            # Директории, где уже есть .session — их tdata пропускаем (только для 'both')
+            session_parents = {os.path.dirname(sp) for sp in session_files}
+
+            def _covered_by_session(tdata_path: str) -> bool:
+                parent = os.path.dirname(tdata_path.rstrip("/"))
+                return parent in session_parents or tdata_path in session_parents
+
+            # 1. .session файлы
+            if mode in ("session", "both"):
+                for sp in session_files:
+                    name = os.path.relpath(sp, temp_dir)
+                    try:
+                        data = Path(sp).read_bytes()
+                        res = await self.import_session_file(data, api_id, api_hash)
+                        accounts.append((*res, f"session:{name}"))
+                    except Exception as e:
+                        errors.append(f"{name}: {e}")
+
+            # 2. tdata-папки
+            if mode in ("tdata", "both"):
+                for tp in tdata_dirs:
+                    if mode == "both" and _covered_by_session(tp):
+                        continue
+                    label = os.path.relpath(tp, temp_dir)
+                    try:
+                        res = await self._tdata_path_to_session(tp, api_id, api_hash, password)
+                        accounts.append((*res, f"tdata:{label}"))
+                    except Exception as e:
+                        errors.append(f"tdata {label}: {e}")
+
+            return accounts, errors
+        finally:
             try:
                 shutil.rmtree(temp_dir)
             except Exception:

@@ -174,11 +174,20 @@ async def import_session(
     file: UploadFile = File(...),
     db: aiosqlite.Connection = Depends(get_db)
 ):
-    """Импорт существующей сессии (.session) через файл или строку."""
+    """
+    Импорт сессий. Принимает либо один файл .session/StringSession,
+    либо .zip архив с НЕСКОЛЬКИМИ .session (папки tdata игнорируются).
+    """
     if not DEFAULT_API_ID or not DEFAULT_API_HASH:
         raise HTTPException(400, "TG_API_ID и TG_API_HASH не заданы в .env файле")
 
     file_content = await file.read()
+
+    # ZIP → массовый импорт всех .session
+    if file_content[:4] == b"PK\x03\x04":
+        return await _bulk_import_response(db, file_content, mode="session")
+
+    # Одиночный .session / StringSession
     try:
         phone, first_name, last_name, username, session_string = await telegram_manager.import_session_file(
             file_content, DEFAULT_API_ID, DEFAULT_API_HASH
@@ -187,49 +196,13 @@ async def import_session(
         raise HTTPException(400, f"Ошибка импорта сессии: {e}")
 
     if not phone:
-        # Если телефон не отдан Telegram'ом (крайне редко), сгенерируем псевдо-номер или выдадим ошибку
         phone = f"imported_{username or 'user'}"
-
-    # Проверяем, есть ли уже этот телефон в базе
-    async with db.execute("SELECT id FROM accounts WHERE phone = ?", (phone,)) as cur:
-        row = await cur.fetchone()
-
-    if row:
-        account_id = row["id"]
-        await db.execute(
-            """UPDATE accounts SET
-                 api_id = ?, api_hash = ?, first_name = ?, last_name = ?, username = ?, status = 'active', is_spam_blocked = 0
-               WHERE id = ?""",
-            (DEFAULT_API_ID, DEFAULT_API_HASH, first_name, last_name, username, account_id)
-        )
-    else:
-        # Вставляем новый
-        async with db.execute(
-            """INSERT INTO accounts (phone, api_id, api_hash, first_name, last_name, username, session_name, status)
-               VALUES (?, ?, ?, ?, ?, ?, '', 'active')""",
-            (phone, DEFAULT_API_ID, DEFAULT_API_HASH, first_name, last_name, username)
-        ) as cur:
-            account_id = cur.lastrowid
-        
-        # Обновляем session_name
-        await db.execute(
-            "UPDATE accounts SET session_name = ? WHERE id = ?",
-            (str(account_id), account_id)
-        )
-    # Авто-привязка рабочего прокси, если у аккаунта его ещё нет.
-    async with db.execute("SELECT proxy_id FROM accounts WHERE id = ?", (account_id,)) as cur:
-        prow = await cur.fetchone()
-    if prow and prow["proxy_id"] is None:
-        auto_pid = await _pick_working_proxy(db)
-        if auto_pid is not None:
-            await db.execute("UPDATE accounts SET proxy_id = ? WHERE id = ?", (auto_pid, account_id))
-    await db.commit()
-
-    # Конвертируем и записываем сессию в бинарный SQLite файл
-    telegram_manager.save_session_string_as_sqlite(session_string, account_id, DEFAULT_API_ID, DEFAULT_API_HASH)
-
-    # Инициализируем в менеджере
-    await telegram_manager.load_session(account_id, DEFAULT_API_ID, DEFAULT_API_HASH)
+    try:
+        account_id = await _persist_imported_account(db, phone, first_name, last_name, username, session_string)
+    except Exception as e:
+        import traceback
+        logger.error("Ошибка сохранения сессии (import-session):\n" + traceback.format_exc())
+        raise HTTPException(400, f"Сессия распознана, но не удалось её сохранить: {e}")
 
     return {"ok": True, "account_id": account_id, "phone": phone}
 
@@ -240,48 +213,71 @@ async def import_tdata(
     password: Optional[str] = None,
     db: aiosqlite.Connection = Depends(get_db)
 ):
-    """Импорт аккаунта из архива tdata папки."""
+    """
+    Импорт из архива. Берёт ТОЛЬКО папки tdata (все, что есть в архиве),
+    остальные файлы (.session, .json и т.п.) игнорируются.
+    """
     if not DEFAULT_API_ID or not DEFAULT_API_HASH:
         raise HTTPException(400, "TG_API_ID и TG_API_HASH не заданы в .env файле")
 
     file_content = await file.read()
+    if file_content[:4] != b"PK\x03\x04":
+        raise HTTPException(400, "Ожидается .zip архив (внутри — одна или несколько папок tdata)")
+
+    return await _bulk_import_response(db, file_content, mode="tdata", password=password)
+
+
+async def _bulk_import_response(db, file_content: bytes, mode: str, password: Optional[str] = None) -> dict:
+    """Общий разбор архива + сохранение всех найденных аккаунтов. mode: 'session'|'tdata'|'both'."""
+    import traceback
     try:
-        phone, first_name, last_name, username, session_string = await telegram_manager.import_tdata_zip(
-            file_content, DEFAULT_API_ID, DEFAULT_API_HASH, password
+        accounts, errors = await telegram_manager.parse_bulk_archive(
+            file_content, DEFAULT_API_ID, DEFAULT_API_HASH, password, mode=mode
         )
     except Exception as e:
-        raise HTTPException(400, f"Ошибка импорта TData: {e}")
+        logger.error(f"Ошибка разбора архива (mode={mode}):\n" + traceback.format_exc())
+        raise HTTPException(400, f"Не удалось прочитать архив: {e}")
 
-    if not phone:
-        phone = f"imported_td_{username or 'user'}"
+    imported = []
+    for phone, first_name, last_name, username, session_string, source in accounts:
+        if not phone:
+            phone = f"imported_{username or source}"
+        try:
+            acc_id = await _persist_imported_account(db, phone, first_name, last_name, username, session_string)
+            imported.append({"account_id": acc_id, "phone": phone, "source": source})
+        except Exception as e:
+            logger.error(f"Ошибка сохранения аккаунта {source}:\n" + traceback.format_exc())
+            errors.append(f"{source}: {e}")
 
-    # Проверяем, есть ли уже этот телефон в базе
+    if not imported and not accounts:
+        hint = "папок tdata" if mode == "tdata" else "файлов .session"
+        raise HTTPException(400, f"В архиве не найдено {hint}." + (f" Ошибки: {errors[0]}" if errors else ""))
+
+    return {"ok": True, "imported": len(imported), "accounts": imported, "errors": errors}
+
+
+async def _persist_imported_account(db, phone, first_name, last_name, username, session_string) -> int:
+    """Сохраняет один импортированный аккаунт (dedupe по телефону) и поднимает сессию."""
     async with db.execute("SELECT id FROM accounts WHERE phone = ?", (phone,)) as cur:
         row = await cur.fetchone()
 
     if row:
         account_id = row["id"]
         await db.execute(
-            """UPDATE accounts SET
-                 api_id = ?, api_hash = ?, first_name = ?, last_name = ?, username = ?, status = 'active', is_spam_blocked = 0
-               WHERE id = ?""",
+            """UPDATE accounts SET api_id=?, api_hash=?, first_name=?, last_name=?, username=?,
+                 status='active', is_spam_blocked=0 WHERE id=?""",
             (DEFAULT_API_ID, DEFAULT_API_HASH, first_name, last_name, username, account_id)
         )
     else:
-        # Вставляем новый
         async with db.execute(
             """INSERT INTO accounts (phone, api_id, api_hash, first_name, last_name, username, session_name, status)
                VALUES (?, ?, ?, ?, ?, ?, '', 'active')""",
             (phone, DEFAULT_API_ID, DEFAULT_API_HASH, first_name, last_name, username)
         ) as cur:
             account_id = cur.lastrowid
-        
-        # Обновляем session_name
-        await db.execute(
-            "UPDATE accounts SET session_name = ? WHERE id = ?",
-            (str(account_id), account_id)
-        )
-    # Авто-привязка рабочего прокси, если у аккаунта его ещё нет.
+        await db.execute("UPDATE accounts SET session_name = ? WHERE id = ?", (str(account_id), account_id))
+
+    # Авто-привязка рабочего прокси
     async with db.execute("SELECT proxy_id FROM accounts WHERE id = ?", (account_id,)) as cur:
         prow = await cur.fetchone()
     if prow and prow["proxy_id"] is None:
@@ -290,13 +286,47 @@ async def import_tdata(
             await db.execute("UPDATE accounts SET proxy_id = ? WHERE id = ?", (auto_pid, account_id))
     await db.commit()
 
-    # Конвертируем и записываем сессию в бинарный SQLite файл
     telegram_manager.save_session_string_as_sqlite(session_string, account_id, DEFAULT_API_ID, DEFAULT_API_HASH)
-
-    # Инициализируем в менеджере
     await telegram_manager.load_session(account_id, DEFAULT_API_ID, DEFAULT_API_HASH)
+    return account_id
 
-    return {"ok": True, "account_id": account_id, "phone": phone}
+
+@router.post("/import-bulk")
+async def import_bulk(
+    file: UploadFile = File(...),
+    password: Optional[str] = None,
+    db: aiosqlite.Connection = Depends(get_db)
+):
+    """
+    Массовый импорт: один .zip архив с несколькими аккаунтами —
+    любыми .session файлами и/или папками tdata внутри.
+    """
+    if not DEFAULT_API_ID or not DEFAULT_API_HASH:
+        raise HTTPException(400, "TG_API_ID и TG_API_HASH не заданы в .env файле")
+
+    import traceback
+
+    content = await file.read()
+    try:
+        accounts, errors = await telegram_manager.parse_bulk_archive(
+            content, DEFAULT_API_ID, DEFAULT_API_HASH, password
+        )
+    except Exception as e:
+        logger.error("Ошибка разбора bulk-архива:\n" + traceback.format_exc())
+        raise HTTPException(400, f"Не удалось прочитать архив: {e}")
+
+    imported = []
+    for phone, first_name, last_name, username, session_string, source in accounts:
+        if not phone:
+            phone = f"imported_{username or source}"
+        try:
+            acc_id = await _persist_imported_account(db, phone, first_name, last_name, username, session_string)
+            imported.append({"account_id": acc_id, "phone": phone, "source": source})
+        except Exception as e:
+            logger.error(f"Ошибка сохранения аккаунта {source}:\n" + traceback.format_exc())
+            errors.append(f"{source}: {e}")
+
+    return {"ok": True, "imported": len(imported), "accounts": imported, "errors": errors}
 
 
 # ─────────────────────────────────────────────────────

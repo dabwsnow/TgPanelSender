@@ -67,6 +67,13 @@ export const accountsApi = {
     return postForm('/accounts/import-tdata', fd);
   },
 
+  importBulk:     (file, password = '') => {
+    const fd = new FormData();
+    fd.append('file', file);
+    const q = password ? `?password=${encodeURIComponent(password)}` : '';
+    return postForm('/accounts/import-bulk' + q, fd);
+  },
+
   updateProfile:  (id, data)    => put(`/accounts/${id}/profile`, data),
   updateAutoResponder: (id, data) => put(`/accounts/${id}/autoresponder`, data),
 
