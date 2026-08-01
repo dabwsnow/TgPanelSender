@@ -1,0 +1,8 @@
+backend/venv/
+backend/__pycache__/
+**/__pycache__/
+.git/
+.DS_Store
+*.db-journal
+*.db-wal
+*.db-shm

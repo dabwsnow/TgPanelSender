@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TGPanel — Вход</title>
+  <style>
+    body {
+      background: #000000;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .login-card {
+      background: #0c0c0c;
+      border: 1px solid #181818;
+      border-radius: 12px;
+      padding: 40px 30px;
+      width: 320px;
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+    }
+    .title {
+      font-size: 16px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      margin-bottom: 28px;
+    }
+    .input-group {
+      margin-bottom: 24px;
+      text-align: left;
+    }
+    label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #666666;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    input {
+      width: 100%;
+      background: #181818;
+      border: 1px solid #222222;
+      border-radius: 6px;
+      padding: 12px;
+      box-sizing: border-box;
+      color: #ffffff;
+      font-size: 16px;
+      text-align: center;
+      letter-spacing: 2px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #ffffff;
+    }
+    button {
+      width: 100%;
+      background: #ffffff;
+      color: #000000;
+      border: none;
+      border-radius: 6px;
+      padding: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 14px;
+      transition: opacity 0.15s;
+    }
+    button:hover {
+      opacity: 0.9;
+    }
+    .error-msg {
+      color: #ff3333;
+      font-size: 13px;
+      margin-top: 14px;
+      display: none;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="title">TGPanel</div>
+    <form id="login-form">
+      <div class="input-group">
+        <label>Пароль администратора</label>
+        <input type="password" id="password-field" placeholder="Введи пароль..." required autofocus>
+      </div>
+      <button type="submit" id="submit-btn">Войти</button>
+      <div class="error-msg" id="error-box">Неверный пароль!</div>
+    </form>
+  </div>
+  <script>
+    document.getElementById('login-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const password = document.getElementById('password-field').value;
+      const btn = document.getElementById('submit-btn');
+      const err = document.getElementById('error-box');
+      
+      btn.disabled = true;
+      btn.innerText = 'Вход...';
+      err.style.display = 'none';
+      
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        
+        if (res.ok) {
+          location.reload();
+        } else {
+          throw new Error();
+        }
+      } catch {
+        btn.disabled = false;
+        btn.innerText = 'Войти';
+        err.style.display = 'block';
+        const field = document.getElementById('password-field');
+        field.value = '';
+        field.focus();
+        field.style.borderColor = '#ff3333';
+        setTimeout(() => {
+          field.style.borderColor = '#222222';
+        }, 2000);
+      }
+    };
+  </script>
+</body>
+</html>

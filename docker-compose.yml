@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  tgpanel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgpanel-app
+    ports:
+      - "9999:9999"
+    volumes:
+      # Прокидываем базу данных, сессии и загрузки наружу, чтобы данные не терялись при перезапуске контейнера
+      - ./backend/tgpanel.db:/app/backend/tgpanel.db
+      - ./backend/sessions:/app/backend/sessions
+      - ./backend/uploads:/app/backend/uploads
+      - ./backend/.env:/app/backend/.env
+    restart: always

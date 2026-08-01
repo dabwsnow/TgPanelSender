@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+telethon
+aiosqlite
+python-multipart
+apscheduler
+python-dotenv
+aiofiles
+aiohttp
+emoji
+PySocks
